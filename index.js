@@ -238,6 +238,30 @@ app.get('/status', (req, res) => {
   res.json({ success: true, connected, status });
 });
 
+app.get('/diag', (req, res) => {
+  // Lightweight diagnostic: verifies auth dir exists/writable & lists contents.
+  const info = {
+    authDir,
+    exists: fs.existsSync(authDir),
+    files: [],
+    writable: false,
+    volumeEnv: process.env.RAILWAY_VOLUME_MOUNT_PATH || null,
+  };
+  try {
+    if (info.exists) {
+      info.files = fs.readdirSync(authDir).slice(0, 20);
+      // Write/read test
+      const testFile = path.join(authDir, '.diag_write_test');
+      fs.writeFileSync(testFile, String(Date.now()));
+      info.writable = true;
+      fs.unlinkSync(testFile);
+    }
+  } catch (e) {
+    info.error = e.message;
+  }
+  res.json({ success: true, ...info });
+});
+
 app.get('/qr', (req, res) => {
   if (connected) return res.json({ success: true, connected: true, qr: null });
   if (qrDataUrl) return res.json({ success: true, connected: false, qr: qrDataUrl });
