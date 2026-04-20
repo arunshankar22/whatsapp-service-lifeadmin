@@ -1,52 +1,44 @@
-# WhatsApp Connector (Railway)
+# WhatsApp Connector (Baileys, Railway-ready)
 
-A tiny Node.js service that wraps [whatsapp-web.js](https://wwebjs.dev/) and exposes a JSON API for the LifeAdmin AI backend.
+Pure Node.js WhatsApp Web client using [Baileys](https://github.com/WhiskeySockets/Baileys). **No Chromium, no Puppeteer** — deploys in under a minute on Railway.
 
 ## Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/status` | `{connected, status}` |
-| GET | `/qr` | QR data URL for linking a WhatsApp account |
-| GET | `/chats?limit=20` | Recent chats |
-| GET | `/chat-messages/:chatId?limit=100` | Chat messages |
-| POST | `/send` | `{phone OR group, message}` |
-| POST | `/disconnect` | Log out |
-| POST | `/restart` | Restart the whatsapp-web.js client |
+| GET  | `/status`                     | `{connected, status}` |
+| GET  | `/qr`                         | QR data URL for linking a WhatsApp account |
+| GET  | `/chats?limit=20`             | Recent chats |
+| GET  | `/chat-messages/:chatId`      | Messages cached since service start |
+| POST | `/send`                       | Body `{phone, message}` or `{group, message}` |
+| POST | `/disconnect`                 | Log out and wipe local auth |
+| POST | `/restart`                    | Recycle the WA socket |
 
-## Auth (recommended for public deploys)
+## Auth (recommended)
 
-Set `WHATSAPP_SERVICE_TOKEN` to a long random string. Every request then requires:
-
+Set `WHATSAPP_SERVICE_TOKEN` to a long random string. All requests then require:
 ```
 Authorization: Bearer <token>
 ```
-
-Set the **same** value on the FastAPI backend (`WHATSAPP_SERVICE_TOKEN` env var) — it will be sent automatically.
-
-Leave unset for open access (local dev only).
+Leave unset for open access (local dev only). Set the **same** value on the FastAPI backend — it will be sent automatically.
 
 ## Deploy on Railway
 
 1. Push this folder to a GitHub repo.
 2. Railway → New Project → Deploy from GitHub repo.
 3. **Variables:**
-   - `WHATSAPP_SERVICE_TOKEN` = your random string (64+ chars)
-   - Railway auto-sets `PORT`.
-4. **Volume (important):** attach a persistent volume at `/app/.wwebjs_auth` so your WhatsApp session survives redeploys. Otherwise you'll need to scan the QR code again after every deploy.
-5. After first deploy, visit `https://<your-app>.up.railway.app/qr` (or use the LifeAdmin UI) to scan the QR and link an account.
+   - `WHATSAPP_SERVICE_TOKEN` = long random string (same as on backend)
+4. **Volume** (important): attach a persistent volume with mount path `/usr/src/app/.wa_auth` so your WhatsApp session survives redeploys. Without it, you'll re-scan the QR every deploy.
+5. After first deploy, hit `GET /qr` (with your token) and scan the returned QR code with WhatsApp → Linked Devices.
 
 ## Local dev
 
 ```bash
 npm install
-node index.js          # listens on 3001, no token required
+node index.js          # listens on 3001
 ```
 
-## Env vars
+## Caveats
 
-| Var | Purpose |
-|---|---|
-| `PORT` | HTTP port (Railway sets automatically, local default 3001) |
-| `WHATSAPP_SERVICE_TOKEN` | Optional shared-secret for Bearer auth |
-| `PUPPETEER_EXECUTABLE_PATH` | Override Chromium path (Nixpacks / custom Docker) |
+- **Message history**: Baileys only surfaces messages it observes during the session. On first connect, WhatsApp pushes a partial history (chats.set / messaging-history.set) which we cache. Older messages are not retrievable without an active session that has seen them.
+- **Group send by name**: uses case-insensitive substring match on group subject. If you have multiple similar group names, pass the full JID (`123456@g.us`) in the `group` field instead.
