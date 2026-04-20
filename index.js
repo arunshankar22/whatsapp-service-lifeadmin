@@ -1,14 +1,41 @@
+/*
+ * WhatsApp Connector (Baileys edition)
+ *
+ * Pure Node.js WhatsApp Web client — no Chromium, no Puppeteer.
+ * Exposes the same JSON API shape that LifeAdmin's FastAPI backend expects.
+ *
+ * Endpoints:
+ *   GET  /status                    -> {connected, status}
+ *   GET  /qr                        -> {qr: dataUrl}
+ *   GET  /chats?limit=20            -> {chats: [...]}
+ *   GET  /chat-messages/:id?limit=N -> {chatName, messages: [...]}
+ *   POST /send  body: {phone|group, message}
+ *   POST /disconnect
+ *   POST /restart
+ *
+ * Env vars:
+ *   PORT                      HTTP port (Railway sets automatically, default 3001)
+ *   WHATSAPP_SERVICE_TOKEN    Optional Bearer token for all endpoints
+ */
+
+const {
+  default: makeWASocket,
+  DisconnectReason,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
 const express = require('express');
 const cors = require('cors');
-const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
+const P = require('pino');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-// Optional shared-secret auth. Set WHATSAPP_SERVICE_TOKEN on both this service
-// and the FastAPI backend (same value) to enable. Leave unset for open access.
+// ---------- Optional Bearer auth ----------
 const SERVICE_TOKEN = (process.env.WHATSAPP_SERVICE_TOKEN || '').trim();
 if (SERVICE_TOKEN) {
   console.log('[WhatsApp] Bearer token auth ENABLED');
@@ -23,371 +50,305 @@ if (SERVICE_TOKEN) {
   console.log('[WhatsApp] Bearer token auth DISABLED (WHATSAPP_SERVICE_TOKEN not set)');
 }
 
-// Railway assigns a port via env. Falls back to 3001 for local dev.
-const PORT = parseInt(process.env.PORT, 10) || 3001;
+// ---------- State ----------
+const authDir = path.resolve(__dirname, '.wa_auth');
+let sock = null;
+let qrDataUrl = null;
+let status = 'disconnected';   // disconnected | qr_ready | connecting | connected
+let connected = false;
+let reconnectTimer = null;
 
-let qrCodeData = null;
-let clientStatus = 'disconnected'; // disconnected, qr_pending, connected
-let clientReady = false;
+// Chat + message caches (in-memory; persists only while process is alive)
+const chats = new Map();           // jid -> {id, name, isGroup, lastMessage, timestamp, unreadCount}
+const messagesByChat = new Map();  // jid -> Array<msg>
+const MAX_MSGS_PER_CHAT = 500;
 
-// In-memory message cache — stores recent messages per chat
-const messageCache = new Map(); // chatId -> [{...msg}]
-const MAX_CACHED_MESSAGES = 500;
-
-// Cache of chat list for name lookups when getChats fails
-let cachedChatList = [];
-
-// Puppeteer config — on Railway, let puppeteer use its bundled Chromium.
-// Override via PUPPETEER_EXECUTABLE_PATH env var if you need a custom binary.
-const puppeteerConfig = {
-  headless: true,
-  args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--single-process',
-  ],
-};
-if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-  puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+// ---------- Helpers ----------
+function extractText(msg) {
+  const m = msg.message || {};
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    ''
+  );
 }
 
-// Initialize WhatsApp client
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
-  puppeteer: puppeteerConfig,
-});
+function normalisePhone(phone) {
+  const cleaned = (phone || '').replace(/[^0-9]/g, '');
+  return cleaned + '@s.whatsapp.net';
+}
 
-client.on('qr', async (qr) => {
-  console.log('[WhatsApp] QR code received');
-  qrCodeData = await qrcode.toDataURL(qr);
-  clientStatus = 'qr_pending';
-});
+function cacheMessage(msg) {
+  const jid = msg.key?.remoteJid;
+  if (!jid || jid === 'status@broadcast') return;
+  const text = extractText(msg);
+  const entry = {
+    id: msg.key.id,
+    body: text,
+    fromMe: !!msg.key.fromMe,
+    timestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
+    from: jid,
+    senderName: msg.key.fromMe
+      ? 'You'
+      : msg.pushName || (msg.key.participant ? msg.key.participant.split('@')[0] : jid.split('@')[0]),
+    type: Object.keys(msg.message || {})[0] || 'text',
+    hasMedia: !!(msg.message?.imageMessage || msg.message?.videoMessage || msg.message?.audioMessage || msg.message?.documentMessage),
+  };
 
-client.on('ready', () => {
-  console.log('[WhatsApp] Client ready and connected');
-  clientStatus = 'connected';
-  clientReady = true;
-  qrCodeData = null;
+  if (!messagesByChat.has(jid)) messagesByChat.set(jid, []);
+  const arr = messagesByChat.get(jid);
+  arr.push(entry);
+  if (arr.length > MAX_MSGS_PER_CHAT) arr.shift();
 
-  // Preload recent chats into cache
-  client.getChats().then(chats => {
-    chats.slice(0, 20).forEach(chat => {
-      if (chat.lastMessage) {
-        const chatId = chat.id._serialized;
-        if (!messageCache.has(chatId)) messageCache.set(chatId, []);
-        const cached = messageCache.get(chatId);
-        const msg = chat.lastMessage;
-        cached.push({
-          id: msg.id?._serialized || 'last',
-          body: msg.body || '',
-          fromMe: msg.fromMe,
-          timestamp: msg.timestamp,
-          senderName: msg.fromMe ? 'You' : (msg._data?.notifyName || ''),
-          type: msg.type || 'chat',
-          hasMedia: msg.hasMedia || false,
-        });
+  // Update chat entry
+  const existing = chats.get(jid) || {};
+  chats.set(jid, {
+    id: jid,
+    name: existing.name || msg.pushName || jid.split('@')[0],
+    isGroup: jid.endsWith('@g.us'),
+    timestamp: entry.timestamp,
+    lastMessage: {
+      body: (text || '').substring(0, 200),
+      timestamp: entry.timestamp,
+      fromMe: entry.fromMe,
+    },
+    unreadCount: existing.unreadCount || 0,
+  });
+}
+
+// ---------- WhatsApp client ----------
+async function start() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  const { version } = await fetchLatestBaileysVersion();
+  console.log(`[WhatsApp] Using WA version ${version.join('.')}`);
+
+  sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    logger: P({ level: 'silent' }),
+    browser: ['LifeAdmin AI', 'Chrome', '1.0'],
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+  });
+
+  status = 'connecting';
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      try {
+        qrDataUrl = await qrcode.toDataURL(qr);
+        status = 'qr_ready';
+        console.log('[WhatsApp] QR code ready');
+      } catch (e) {
+        console.error('[WhatsApp] QR encode error:', e.message);
       }
-    });
-    console.log(`[WhatsApp] Preloaded ${messageCache.size} chat caches`);
-    // Cache the chat list for name lookups
-    cachedChatList = chats.slice(0, 50).map(chat => ({
-      id: chat.id._serialized,
-      name: chat.name || chat.pushname || chat.id.user,
-      isGroup: chat.isGroup,
-      unreadCount: chat.unreadCount,
-      timestamp: chat.timestamp,
-    }));
-  }).catch(() => {});
-});
+    }
 
-// Cache all incoming messages
-client.on('message', (msg) => {
-  const chatId = msg.from;
-  if (!messageCache.has(chatId)) messageCache.set(chatId, []);
-  const cached = messageCache.get(chatId);
-  cached.push({
-    id: msg.id._serialized,
-    body: msg.body || '',
-    fromMe: false,
-    timestamp: msg.timestamp,
-    senderName: msg._data?.notifyName || msg.author?.replace('@c.us', '') || '',
-    type: msg.type,
-    hasMedia: msg.hasMedia,
+    if (connection === 'close') {
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const reason = lastDisconnect?.error?.message || 'unknown';
+      connected = false;
+      status = 'disconnected';
+      qrDataUrl = null;
+      console.log(`[WhatsApp] Disconnected (${code}): ${reason}`);
+      if (code !== DisconnectReason.loggedOut) {
+        reconnectTimer = setTimeout(() => start().catch(e => console.error('Reconnect error:', e.message)), 5000);
+      }
+    } else if (connection === 'open') {
+      connected = true;
+      status = 'connected';
+      qrDataUrl = null;
+      console.log('[WhatsApp] Connected');
+    }
   });
-  if (cached.length > MAX_CACHED_MESSAGES) cached.shift();
-});
 
-// Cache outgoing messages too
-client.on('message_create', (msg) => {
-  if (!msg.fromMe) return;
-  const chatId = msg.to;
-  if (!messageCache.has(chatId)) messageCache.set(chatId, []);
-  const cached = messageCache.get(chatId);
-  cached.push({
-    id: msg.id._serialized,
-    body: msg.body || '',
-    fromMe: true,
-    timestamp: msg.timestamp,
-    senderName: 'You',
-    type: msg.type,
-    hasMedia: msg.hasMedia,
+  // Populate chat list from server events
+  sock.ev.on('messaging-history.set', ({ chats: chatList, messages }) => {
+    for (const c of chatList || []) {
+      const existing = chats.get(c.id) || {};
+      chats.set(c.id, {
+        id: c.id,
+        name: c.name || existing.name || c.id.split('@')[0],
+        isGroup: c.id.endsWith('@g.us'),
+        unreadCount: c.unreadCount || 0,
+        timestamp: Number(c.conversationTimestamp) || existing.timestamp || 0,
+        lastMessage: existing.lastMessage || null,
+      });
+    }
+    for (const m of messages || []) cacheMessage(m);
+    console.log(`[WhatsApp] History sync: ${chats.size} chats, ${messagesByChat.size} with messages`);
   });
-  if (cached.length > MAX_CACHED_MESSAGES) cached.shift();
-});
 
-client.on('authenticated', () => {
-  console.log('[WhatsApp] Authenticated');
-});
+  sock.ev.on('chats.upsert', (arr) => {
+    for (const c of arr) {
+      const existing = chats.get(c.id) || {};
+      chats.set(c.id, {
+        id: c.id,
+        name: c.name || existing.name || c.id.split('@')[0],
+        isGroup: c.id.endsWith('@g.us'),
+        unreadCount: c.unreadCount || 0,
+        timestamp: Number(c.conversationTimestamp) || existing.timestamp || 0,
+        lastMessage: existing.lastMessage || null,
+      });
+    }
+  });
 
-client.on('auth_failure', (msg) => {
-  console.error('[WhatsApp] Auth failure:', msg);
-  clientStatus = 'disconnected';
-  clientReady = false;
-});
+  sock.ev.on('chats.update', (arr) => {
+    for (const c of arr) {
+      const existing = chats.get(c.id) || {};
+      chats.set(c.id, {
+        ...existing,
+        id: c.id,
+        name: c.name || existing.name,
+        isGroup: c.id?.endsWith('@g.us'),
+        unreadCount: c.unreadCount ?? existing.unreadCount,
+        timestamp: Number(c.conversationTimestamp) || existing.timestamp,
+      });
+    }
+  });
 
-client.on('disconnected', (reason) => {
-  console.log('[WhatsApp] Disconnected:', reason);
-  clientStatus = 'disconnected';
-  clientReady = false;
-  qrCodeData = null;
-});
+  sock.ev.on('contacts.upsert', async (contacts) => {
+    for (const c of contacts) {
+      const existing = chats.get(c.id);
+      if (existing && (c.name || c.notify)) {
+        existing.name = c.name || c.notify || existing.name;
+      }
+    }
+  });
 
-// Routes
+  sock.ev.on('messages.upsert', ({ messages }) => {
+    for (const m of messages) cacheMessage(m);
+  });
+}
+
+// ---------- HTTP endpoints ----------
 app.get('/status', (req, res) => {
-  res.json({
-    success: true,
-    connected: clientReady,
-    status: clientStatus,
-  });
+  res.json({ success: true, connected, status });
 });
 
 app.get('/qr', (req, res) => {
-  if (clientReady) {
-    return res.json({ success: true, connected: true, qr: null });
-  }
-  if (qrCodeData) {
-    return res.json({ success: true, connected: false, qr: qrCodeData });
-  }
+  if (connected) return res.json({ success: true, connected: true, qr: null });
+  if (qrDataUrl) return res.json({ success: true, connected: false, qr: qrDataUrl });
   return res.json({ success: true, connected: false, qr: null, message: 'Initializing... try again in a few seconds' });
 });
 
 app.post('/send', async (req, res) => {
-  if (!clientReady) {
-    return res.status(400).json({ success: false, error: 'WhatsApp not connected' });
-  }
-
-  const { phone, group, message } = req.body;
+  if (!connected || !sock) return res.status(400).json({ success: false, error: 'WhatsApp not connected' });
+  const { phone, group, message } = req.body || {};
   if ((!phone && !group) || !message) {
     return res.status(400).json({ success: false, error: 'phone or group name required, plus message' });
   }
 
   try {
-    let chatId;
-
+    let jid;
     if (group) {
-      // Find group by name (case-insensitive partial match)
-      const chats = await client.getChats();
-      const match = chats.find(c => c.isGroup && c.name && c.name.toLowerCase().includes(group.toLowerCase()));
-      if (!match) {
-        return res.status(404).json({ success: false, error: `Group "${group}" not found. Available groups: ${chats.filter(c => c.isGroup).map(c => c.name).join(', ')}` });
+      // group may be a full JID already (...@g.us) or a name
+      if (group.endsWith('@g.us')) {
+        jid = group;
+      } else {
+        // Try cache first
+        let match = [...chats.values()].find(
+          c => c.isGroup && c.name && c.name.toLowerCase().includes(group.toLowerCase())
+        );
+        if (!match) {
+          // Fresh fetch
+          const all = await sock.groupFetchAllParticipating();
+          const found = Object.values(all).find(g => (g.subject || '').toLowerCase().includes(group.toLowerCase()));
+          if (!found) {
+            return res.status(404).json({ success: false, error: `Group "${group}" not found` });
+          }
+          jid = found.id;
+          chats.set(jid, { id: jid, name: found.subject, isGroup: true, timestamp: Date.now() / 1000, unreadCount: 0, lastMessage: null });
+        } else {
+          jid = match.id;
+        }
       }
-      chatId = match.id._serialized;
-      console.log(`[WhatsApp] Resolved group "${group}" -> ${chatId} (${match.name})`);
     } else {
-      // Format phone number: ensure it has country code and @c.us suffix
-      chatId = phone.replace(/[^0-9]/g, '');
-      if (!chatId.includes('@')) {
-        chatId = chatId + '@c.us';
-      }
+      jid = phone.includes('@') ? phone : normalisePhone(phone);
     }
 
-    const sentMsg = await client.sendMessage(chatId, message);
-    console.log(`[WhatsApp] Message sent to ${chatId}`);
-    res.json({ success: true, messageId: sentMsg.id._serialized });
+    const sent = await sock.sendMessage(jid, { text: message });
+    console.log(`[WhatsApp] Message sent to ${jid}`);
+    return res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     console.error('[WhatsApp] Send error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.get('/chats', async (req, res) => {
-  if (!clientReady) {
-    return res.status(400).json({ success: false, error: 'WhatsApp not connected' });
-  }
+  if (!connected) return res.status(400).json({ success: false, error: 'WhatsApp not connected' });
+  const limit = parseInt(req.query.limit, 10) || 20;
 
+  // Also merge in groups we're participating in, to ensure they're discoverable
   try {
-    const chats = await client.getChats();
-    const limit = parseInt(req.query.limit) || 20;
-    const chatList = chats.slice(0, limit).map(chat => ({
-      id: chat.id._serialized,
-      name: chat.name || chat.pushname || chat.id.user,
-      isGroup: chat.isGroup,
-      unreadCount: chat.unreadCount,
-      lastMessage: chat.lastMessage ? {
-        body: chat.lastMessage.body?.substring(0, 200),
-        timestamp: chat.lastMessage.timestamp,
-        fromMe: chat.lastMessage.fromMe,
-      } : null,
-      timestamp: chat.timestamp,
-    }));
-
-    // Update cached list
-    cachedChatList = chats.slice(0, 50).map(chat => ({
-      id: chat.id._serialized,
-      name: chat.name || chat.pushname || chat.id.user,
-      isGroup: chat.isGroup,
-      unreadCount: chat.unreadCount,
-      timestamp: chat.timestamp,
-    }));
-
-    res.json({ success: true, chats: chatList });
-  } catch (err) {
-    console.error('[WhatsApp] Chats error:', err.message, '- using cached list');
-    // Return cached chat list when getChats fails
-    if (cachedChatList.length > 0) {
-      const limit = parseInt(req.query.limit) || 20;
-      return res.json({ success: true, chats: cachedChatList.slice(0, limit), cached: true });
-    }
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get('/chat-messages/:chatId', async (req, res) => {
-  if (!clientReady) {
-    return res.status(400).json({ success: false, error: 'WhatsApp not connected' });
-  }
-
-  try {
-    const chatId = req.params.chatId;
-    const limit = parseInt(req.query.limit) || 100;
-
-    // Get chat name first
-    let chatName = chatId;
-    try {
-      const chat = await client.getChatById(chatId);
-      chatName = chat.name || chat.pushname || chatId;
-    } catch (e) {
-      // Use cached chat list for name
-      const cached = cachedChatList.find(c => c.id === chatId);
-      if (cached) chatName = cached.name;
-    }
-
-    // Use searchMessages as a workaround for fetchMessages bug
-    // Search with empty string returns recent messages from the chat
-    let messages = [];
-    try {
-      // First try fetching directly (works for some chats)
-      const chat = await client.getChatById(chatId);
-      try { await chat.sendSeen(); } catch(e) {}
-
-      // Build a contact name cache from group participants
-      const contactNames = {};
-      if (chat.isGroup) {
-        try {
-          const participants = chat.participants || [];
-          for (const p of participants) {
-            try {
-              const contact = await client.getContactById(p.id._serialized);
-              contactNames[p.id._serialized] = contact.pushname || contact.name || contact.shortName || p.id.user;
-              // Also map @lid variants
-              if (p.id._serialized.includes('@')) {
-                contactNames[p.id.user] = contactNames[p.id._serialized];
-              }
-            } catch(e) {}
-          }
-        } catch(e) { console.log(`[WhatsApp] Could not load participants: ${e.message}`); }
-      }
-
-      const resolveNameFromMsg = (msg) => {
-        if (msg.fromMe) return 'You';
-        // Try notifyName first
-        if (msg._data?.notifyName) return msg._data.notifyName;
-        // Try author field
-        const author = msg.author || msg.from || '';
-        // Look up in contact cache
-        if (contactNames[author]) return contactNames[author];
-        // Try just the user part
-        const userPart = author.split('@')[0];
-        if (contactNames[userPart]) return contactNames[userPart];
-        // Last resort: try getContactById
-        return author;
-      };
-
-      const fetched = await chat.fetchMessages({ limit });
-
-      // Resolve names asynchronously for any unresolved IDs
-      const unresolvedIds = new Set();
-      for (const msg of fetched) {
-        const author = msg.author || msg.from || '';
-        if (!msg.fromMe && !msg._data?.notifyName && !contactNames[author]) {
-          unresolvedIds.add(author);
-        }
-      }
-      for (const id of unresolvedIds) {
-        try {
-          const contact = await client.getContactById(id);
-          contactNames[id] = contact.pushname || contact.name || contact.shortName || id.split('@')[0];
-        } catch(e) {}
-      }
-
-      messages = fetched.map(msg => ({
-        id: msg.id._serialized,
-        body: msg.body || '',
-        fromMe: msg.fromMe,
-        timestamp: msg.timestamp,
-        from: msg.from,
-        senderName: resolveNameFromMsg(msg),
-        type: msg.type,
-        hasMedia: msg.hasMedia,
-      }));
-    } catch (fetchErr) {
-      console.log(`[WhatsApp] fetchMessages failed: ${fetchErr.message}, trying searchMessages`);
-      try {
-        const searchResults = await client.searchMessages('', { chatId, limit, page: 1 });
-        messages = searchResults.map(msg => ({
-          id: msg.id._serialized,
-          body: msg.body || '',
-          fromMe: msg.fromMe,
-          timestamp: msg.timestamp,
-          from: msg.from,
-          senderName: msg._data?.notifyName || (msg.fromMe ? 'You' : msg.author?.replace('@c.us', '') || ''),
-          type: msg.type,
-          hasMedia: msg.hasMedia,
-        }));
-      } catch (searchErr) {
-        console.log(`[WhatsApp] searchMessages also failed: ${searchErr.message}`);
-      }
-    }
-
-    if (messages.length === 0) {
-      // Try message cache as final fallback
-      const cached = messageCache.get(chatId) || [];
-      if (cached.length > 0) {
-        return res.json({ success: true, chatName, messages: cached.slice(-limit) });
-      }
-      return res.json({
-        success: true,
-        chatName,
-        messages: [],
-        note: 'No cached messages yet. New messages will appear after they are sent/received while connected.'
+    const all = await sock.groupFetchAllParticipating();
+    for (const g of Object.values(all)) {
+      const existing = chats.get(g.id) || {};
+      chats.set(g.id, {
+        ...existing,
+        id: g.id,
+        name: g.subject || existing.name || g.id.split('@')[0],
+        isGroup: true,
+        unreadCount: existing.unreadCount || 0,
+        timestamp: existing.timestamp || 0,
+        lastMessage: existing.lastMessage || null,
       });
     }
-
-    res.json({ success: true, chatName, messages });
-  } catch (err) {
-    console.error('[WhatsApp] Messages error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+  } catch (e) {
+    // Non-fatal
   }
+
+  const sorted = [...chats.values()]
+    .filter(c => c.id && c.id !== 'status@broadcast')
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+    .slice(0, limit);
+
+  res.json({ success: true, chats: sorted });
+});
+
+app.get('/chat-messages/:chatId(*)', (req, res) => {
+  if (!connected) return res.status(400).json({ success: false, error: 'WhatsApp not connected' });
+  const chatId = req.params.chatId;
+  const limit = parseInt(req.query.limit, 10) || 100;
+  const cached = messagesByChat.get(chatId) || [];
+  const chatName = chats.get(chatId)?.name || chatId;
+  if (cached.length === 0) {
+    return res.json({
+      success: true,
+      chatName,
+      messages: [],
+      note: 'No cached messages yet. Baileys only caches messages it has seen since the service started. New messages will appear as they arrive.',
+    });
+  }
+  res.json({ success: true, chatName, messages: cached.slice(-limit) });
 });
 
 app.post('/disconnect', async (req, res) => {
   try {
-    await client.logout();
-    clientStatus = 'disconnected';
-    clientReady = false;
-    qrCodeData = null;
+    if (sock) {
+      try { await sock.logout(); } catch (_) {}
+    }
+    if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true });
+    connected = false;
+    status = 'disconnected';
+    qrDataUrl = null;
+    sock = null;
+    chats.clear();
+    messagesByChat.clear();
+    // Kick off fresh init for next QR scan
+    reconnectTimer = setTimeout(() => start().catch(e => console.error('Post-disconnect start error:', e.message)), 1000);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -396,19 +357,21 @@ app.post('/disconnect', async (req, res) => {
 
 app.post('/restart', async (req, res) => {
   try {
-    clientStatus = 'disconnected';
-    clientReady = false;
-    qrCodeData = null;
-    await client.destroy();
-    setTimeout(() => client.initialize(), 2000);
+    connected = false;
+    status = 'disconnected';
+    qrDataUrl = null;
+    if (sock) { try { await sock.end(); } catch (_) {} }
+    sock = null;
+    reconnectTimer = setTimeout(() => start().catch(e => console.error('Restart error:', e.message)), 1500);
     res.json({ success: true, message: 'Restarting...' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Start server and WhatsApp client
-app.listen(PORT, () => {
+// ---------- Boot ----------
+const PORT = parseInt(process.env.PORT, 10) || 3001;
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`[WhatsApp Connector] Running on port ${PORT}`);
-  client.initialize();
+  start().catch(e => console.error('[WhatsApp] Initial start error:', e.message));
 });
