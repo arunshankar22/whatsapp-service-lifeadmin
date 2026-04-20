@@ -37,6 +37,16 @@ app.use(express.json({ limit: '10mb' }));
 
 // ---------- Optional Bearer auth ----------
 const SERVICE_TOKEN = (process.env.WHATSAPP_SERVICE_TOKEN || '').trim();
+// Diagnostic: list all env vars starting with WHATSAPP* so we can confirm what
+// the container can see. Value is masked to first/last 2 chars for safety.
+const waKeys = Object.keys(process.env).filter(k => k.startsWith('WHATSAPP'));
+console.log(`[WhatsApp] env keys seen: ${JSON.stringify(waKeys)}`);
+for (const k of waKeys) {
+  const v = process.env[k] || '';
+  const masked = v.length > 4 ? v.slice(0, 2) + '...' + v.slice(-2) + ` (len ${v.length})` : `(len ${v.length})`;
+  console.log(`[WhatsApp]   ${k} = ${masked}`);
+}
+
 if (SERVICE_TOKEN) {
   console.log('[WhatsApp] Bearer token auth ENABLED');
   app.use((req, res, next) => {
