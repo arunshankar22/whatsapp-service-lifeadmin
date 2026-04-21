@@ -270,6 +270,37 @@ app.get('/diag', (req, res) => {
   res.json({ success: true, ...info });
 });
 
+app.get('/persist-test', (req, res) => {
+  // Writes a marker file to authDir with the current boot timestamp, and
+  // reports whether a marker from a PREVIOUS boot was found (proves persistence).
+  const markerFile = path.join(authDir, 'persistence_marker.txt');
+  let previousMarker = null;
+  try {
+    if (fs.existsSync(markerFile)) {
+      previousMarker = fs.readFileSync(markerFile, 'utf8').trim();
+    }
+  } catch (_) {}
+
+  const thisBootId = process.env.RAILWAY_DEPLOYMENT_ID || `boot-${Date.now()}`;
+  try {
+    fs.writeFileSync(markerFile, thisBootId);
+  } catch (e) {
+    return res.json({ success: false, error: e.message });
+  }
+
+  res.json({
+    success: true,
+    previousMarker,
+    thisDeployment: thisBootId,
+    persistent: !!(previousMarker && previousMarker !== thisBootId),
+    note: previousMarker
+      ? (previousMarker !== thisBootId
+          ? '✅ Previous marker found from a different deployment — VOLUME IS PERSISTENT'
+          : '⏳ Same deployment — call again after a redeploy to verify persistence')
+      : '📝 First call — no previous marker. Redeploy and call again to verify.',
+  });
+});
+
 app.get('/qr', (req, res) => {
   if (connected) return res.json({ success: true, connected: true, qr: null });
   if (qrDataUrl) return res.json({ success: true, connected: false, qr: qrDataUrl });
