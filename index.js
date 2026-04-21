@@ -246,6 +246,8 @@ app.get('/diag', (req, res) => {
     files: [],
     writable: false,
     volumeEnv: process.env.RAILWAY_VOLUME_MOUNT_PATH || null,
+    volumeName: process.env.RAILWAY_VOLUME_NAME || null,
+    railwayEnvVars: Object.keys(process.env).filter(k => k.startsWith('RAILWAY')),
   };
   try {
     if (info.exists) {
@@ -255,6 +257,12 @@ app.get('/diag', (req, res) => {
       fs.writeFileSync(testFile, String(Date.now()));
       info.writable = true;
       fs.unlinkSync(testFile);
+    }
+    // Also check volume mount path if env var is set
+    if (info.volumeEnv && info.volumeEnv !== authDir) {
+      info.volumeContents = fs.existsSync(info.volumeEnv)
+        ? fs.readdirSync(info.volumeEnv).slice(0, 20)
+        : 'volume path does not exist';
     }
   } catch (e) {
     info.error = e.message;
