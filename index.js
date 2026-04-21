@@ -52,7 +52,26 @@ if (SERVICE_TOKEN) {
 }
 
 // ---------- State ----------
-const authDir = path.resolve(__dirname, '.wa_auth');
+// Prefer the Railway-provided volume mount path if set; otherwise use a local
+// fallback. This makes the app adapt to however Railway mounts the volume.
+const authDir = path.resolve(
+  process.env.RAILWAY_VOLUME_MOUNT_PATH ||
+  process.env.WA_AUTH_DIR ||
+  path.join(__dirname, '.wa_auth')
+);
+console.log(`[WhatsApp] authDir resolved to: ${authDir}`);
+// Probe common Railway volume mount paths to discover where the volume really is
+const probes = ['/usr/src/app/.wa_auth', '/data', '/app/data', '/mnt/volume', '/var/lib/data'];
+for (const p of probes) {
+  try {
+    const st = fs.statSync(p);
+    if (st.isDirectory()) {
+      console.log(`[WhatsApp]   probe ${p} -> exists, contents: ${JSON.stringify(fs.readdirSync(p).slice(0, 10))}`);
+    }
+  } catch (_) {
+    // Path doesn't exist
+  }
+}
 let sock = null;
 let qrDataUrl = null;
 let status = 'disconnected';   // disconnected | qr_ready | connecting | connected
